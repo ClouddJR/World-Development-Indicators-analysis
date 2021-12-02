@@ -1,0 +1,658 @@
+---
+title: "Data analysis project"
+author: "Arkadiusz Chmura"
+date: "`r format(Sys.time(), '%d-%m-%Y')`"
+output: 
+  html_document: 
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F,
+                      message = F,
+                      warning = F)
+```
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggcorrplot)
+library(plotly)
+library(kableExtra)
+library(caret)
+library(gbm)
+library(quantregForest)
+library(zoo)
+library(forecast)
+```
+
+# Introduction
+
+The following report focuses on analyzing the *World Development Indicators* (WDI) data about the prosperity of many countries in the world with a goal to find some interesting correlations and observations. Additionally, an attempt was made to make a regressor that can predict the price of Bitcoin based on this data (as well as data about gold prices, S&P Composite values, and currency values).
+
+The data has been gathered mainly by the World Bank and it contains more than 200 statistics that measure general market development among most countries in the world.
+
+## Executive summary
+
+First, after reading and cleaning the data, each dataset was thoroughly analyzed and looked at. Missing values were filled and additional filtering was performed to reduce the size of datasets if necessary.
+
+Then, there was a section with a primary focus to find interesting correlations in the WDI dataset. Correlations were calculated separately for each region and the entire dataset as well. Similar patterns were found in each of them. Most strong correlations that were observed were trivial (e.g. population in total growing with the population in urban or rural areas). 
+
+Some were more interesting - like a moderate correlation between the number of under-five deaths (number of children dying before reaching age five) and the total population. It is suggesting that medicine is getting more and more advanced as years go by. The global under-five mortality rate declined by 59 percent since 1990.
+
+Another finding that was quite alarming is that there is a very strong correlation between a total population and the amount of different gases that countries produce that influence climate change and global warming.
+
+There was also a brief overview of the effect that the COVID-19 pandemic had on the global economy. It was observed that there was around a 5% drop in the GDP on average in 2020.
+
+The last section focused on finding a model that could predict the price of Bitcoin. Two algorithms were tried - Stochastic Gradient Boosting and Quantile Random Forest. Both of them performed similarly, but the first one was chosen at the end (based on the R squared, RMSE, and MAE metrics).
+
+After analyzing the variable importance it was found that the most important attribute in predicting the price was the difficulty of finding a new block in the blockchain network.
+
+The final results were not entirely satisfying (RMSE equals almost 2000 and the R squared value around 0.36) and the conclusion was that the dataset does not capture all factors that affect the market price of Bitcoin.
+
+Besides, time series modeling with ARIMA was tried and compared with the regressor. It had an RMSE value around 1300, but it was used to predict only the next 20 values (versus the 813 in the test set for the regressor) and so the comparison would not be very accurate.
+
+## Libraries used
+
+* readxl
+* dplyr
+* tidyr
+* ggplot2
+* ggcorrplot
+* plotly
+* kableExtra
+* caret
+* gbm
+* quantregForest
+* zoo
+* forecast
+
+## Ensuring repeatability
+
+```{r echo=T}
+set.seed(42)
+```
+
+# Reading and cleaning the data
+
+First, all available datasets are read into memory. To make the analysis simpler, some columns are renamed and their type changed. Additionally, blockchain data was scattered among many files. Therefore, they are joined, so that they fit a single data frame.
+
+```{r echo=T, cache=T}
+ex_rates <- read.csv("data/CurrencyExchangeRates.csv", colClasses = c(Date = "POSIXct"))
+gold_prices <- read.csv("data/Gold prices.csv", colClasses = c(Date = "POSIXct"))
+sp_composite <- read.csv("data/S&P Composite.csv", colClasses = c(Year = "POSIXct")) %>% rename(Date = Year)
+
+bchain_difficulty <- read.csv("data/Bitcoin/BCHAIN-DIFF.csv", colClasses = c(Date = "POSIXct"))
+bchain_hash_rate <- read.csv("data/Bitcoin/BCHAIN-HRATE.csv", colClasses = c(Date = "POSIXct"))
+bchain_market_price <- read.csv("data/Bitcoin/BCHAIN-MKPRU.csv", colClasses = c(Date = "POSIXct"))
+bchain_trade_volume <- read.csv("data/Bitcoin/BCHAIN-TRVOU.csv", colClasses = c(Date = "POSIXct"))
+
+bchain <- bchain_difficulty %>% 
+  inner_join(bchain_hash_rate, by = "Date") %>%
+  inner_join(bchain_market_price, by = "Date") %>%
+  inner_join(bchain_trade_volume, by = "Date") %>%
+  rename(Difficulty = 2, Hash_rate = 3, Market_price = 4, Trade_volume = 5)
+
+wdi <- read_excel(
+  path = "data/World_Development_Indicators.xlsx",
+  sheet = 1,
+  na = "..",
+  n_max = 44304
+) %>%
+  rename_with(~ substr(.x, 1, 4), contains("YR"))
+```
+
+The original data about *World Development Indicators* does not include any information about the region that a country belongs to. Therefore, [additional dataset](https://datahelpdesk.worldbank.org/knowledgebase/articles/906519-world-bank-country-and-lending-groups) was obtained from The World Bank website in order to make the analysis simpler.
+
+```{r echo=T, cache=T}
+class <- read_excel("data/CLASS.xlsx")
+
+wdi <- wdi %>% 
+  left_join(class %>% select(Economy, Region), by = c("Country Name" = "Economy"))
+```
+
+This dataset is still "dirty". Each year is a separate column, so those columns were "gathered" into rows (so that there is a single "Year" column now). Then each indicator value is "spread", so that there is a separate column representing each indicator, decreasing the overall row count.
+
+```{r echo=T, cache=T}
+wdi <- wdi %>% 
+  gather(key="Year", value="Value", ("1970":"2020")) %>%
+  mutate(Year = as.numeric(Year)) %>%
+  select(-`Series Name`) %>% 
+  spread(key=`Series Code`, value = Value)
+```
+
+# Dataset overview
+
+## Exchange rates
+
+This dataset contains information about exchange rates. Prices are presented relative to the USD currency. It has 52 attributes and 5978 observations. Only some currencies are shown for brevity.
+
+```{r}
+knitr::kable(summary(ex_rates %>% select(Date, Polish.Zloty, Euro, U.S..Dollar))) %>% kable_styling()
+```
+
+### Missing values
+
+For further analysis, it is considered satisfactory to only focus on one currency. Euro is chosen because of its popularity and the fact that it is mostly free from missing values. Most of the missing values are in years previous than 2000 and the analysis will probably not look that far. Missing values are replaced using the previous entry.
+
+```{r echo=T}
+ex_rates <- ex_rates %>% 
+  select(Date, Euro) %>%
+  fill(Euro, .direction = "updown")
+```
+
+### Quick peek
+
+```{r}
+ex_rates %>% ggplot(aes(x = Date, y = Euro)) + geom_line() + geom_smooth() + ylab("Euro") + ggtitle("Euro price (relative to the USD)") + theme_bw()
+```
+
+## S&P Composite
+
+This dataset contains information about monthly S&P Composite values starting from 1871. There are 1810 records in total.
+
+```{r}
+knitr::kable(summary(sp_composite)) %>% kable_styling() %>% kableExtra::scroll_box(width = "100%")
+```
+
+### Missing values
+
+Most columns do not have missing values. Four columns have just 4 missing values. Only one column has 120 missing values. They are replaced using the previous entry.
+
+```{r echo=T}
+sp_composite <- sp_composite %>%
+  fill(Dividend, Earnings, Real.Dividend, Real.Earnings, Cyclically.Adjusted.PE.Ratio, .direction = "updown")
+```
+
+### Quick peek
+
+```{r}
+sp_composite %>% ggplot(aes(x = Date, y = S.P.Composite)) + xlim(c(as.POSIXct('1980-01-01 00:00:00', format = "%Y-%m-%d %H:%M:%S"),
+     as.POSIXct('2021-11-11 00:00:00', format = "%Y-%m-%d %H:%M:%S"))) + geom_line() + geom_smooth() + ggtitle("S.P.Composite values") + theme_bw()
+```
+
+## Bitcoin
+
+This dataset contains information about Bitcoin's price changing in time as well as some blockchain technology attributes:
+
+* Difficulty - a relative measure of how difficult it is to find a new block. The difficulty is adjusted periodically as a function of how much hashing power has been deployed by the network of miners.
+* Hash rate - the estimated number of tera hashes per second (trillions of hashes per second) the Bitcoin network is performing.
+* Market price - average USD market price across major bitcoin exchanges.
+* Trade volume - the total USD value of trading volume on major bitcoin exchanges.
+
+It has 4659 rows in total.
+
+```{r}
+knitr::kable(summary(bchain)) %>% kable_styling()
+```
+
+### Missing values
+
+Since inner join operations were performed shortly after reading the data, there are no missing values here.
+
+### Quick peek
+
+```{r}
+bchain %>% ggplot(aes(x = Date, y = Market_price)) + geom_line() + geom_smooth() + ylab("Price [USD]") + ggtitle("average bitcoin price (in USD)") + theme_bw()
+```
+
+## Gold prices
+
+This dataset contains information about the price of gold across multiple years, starting from 1968. There are 13585 rows.
+
+```{r}
+knitr::kable(summary(gold_prices)) %>% kable_styling()
+```
+
+### Missing values
+
+For similar reasons as with the exchange rates dataset, only one currency will be chosen. This time, it will be USD.AM column (price taken in the morning), because it has only one missing value. It will be replaced with the previous entry.
+
+```{r echo=T}
+gold_prices <- gold_prices %>%
+  select(Date, USD..AM.) %>%
+  fill(USD..AM.)
+```
+
+### Quick peek
+
+```{r}
+gold_prices %>% ggplot(aes(x = Date, y = USD..AM.)) + geom_line() + geom_smooth() + ylab("Price [USD]") + ggtitle("Gold price (in USD)") + theme_bw()
+```
+
+## World Development Indicators
+
+World Development Indicators (WDI) is the primary World Bank collection of development indicators, compiled from officially recognized international sources. It presents the most current and accurate global development data available and includes national, regional, and global estimates.
+
+WDI contains a large host of socio-economic indicators, from the widely used such as population and GDP to the more esoteric such as the percent of households that consume iodized salt.
+
+This dataset contains information about indicators between the years 1970 and 2020 (10608 rows).
+
+In the table summarizing the data below, only three indicator columns are shown for brevity.
+
+```{r}
+knitr::kable(wdi %>% select(1:7) %>% summary) %>% kable_styling()
+```
+
+### Filtering indicators
+
+Since there are many indicators (213 in total) and it would be quite tedious to focus on all of them, some efforts are made to filter them. Indicators with 20% or more of values that are missing are removed entirely.
+
+```{r echo=T}
+wdi <- wdi %>% 
+  select(where(~mean(is.na(.)) < 0.2))
+```
+
+With this approach, exactly forty indicators are left. That is still a lot, but correlations between them are going to be analyzed to choose which ones will be interesting to examine further.
+
+### Missing values
+
+Missing values for the remaining indicators are going to be filled with the same strategy as for previous datasets (with the previous entry).
+
+```{r echo=T}
+wdi <- wdi %>% 
+  fill(everything(), .direction = "downup")
+```
+
+# Correlations in the WDI dataset
+
+## For the entire dataset
+
+```{r}
+wdi %>% 
+  select(5:40) %>% 
+  cor %>% 
+  ggcorrplot(hc.order = T, type = "lower", outline.col = "white") + 
+  theme(axis.text.x=element_text(size=5), axis.text.y=element_text(size=5))
+```
+
+## For each region separately
+
+### South Asia
+
+```{r}
+wdi %>% 
+  filter(Region == 'South Asia') %>%
+  select(5:40) %>%
+  cor %>% 
+  ggcorrplot(hc.order = T, type = "lower", outline.col = "white") + 
+  theme(axis.text.x=element_text(size=5), axis.text.y=element_text(size=5))
+```
+
+### Europe & Central Asia
+
+```{r}
+wdi %>% 
+  filter(Region == 'Europe & Central Asia') %>%
+  select(5:40) %>%
+  cor %>% 
+  ggcorrplot(hc.order = T, type = "lower", outline.col = "white") + 
+  theme(axis.text.x=element_text(size=5), axis.text.y=element_text(size=5))
+```
+
+### Middle East & North Africa
+
+```{r}
+wdi %>% 
+  filter(Region == 'Middle East & North Africa') %>%
+  select(5:40) %>%
+  cor %>% 
+  ggcorrplot(hc.order = T, type = "lower", outline.col = "white") + 
+  theme(axis.text.x=element_text(size=5), axis.text.y=element_text(size=5))
+```
+
+### East Asia & Pacific
+
+```{r}
+wdi %>% 
+  filter(Region == 'East Asia & Pacific') %>%
+  select(5:40) %>%
+  cor %>% 
+  ggcorrplot(hc.order = T, type = "lower", outline.col = "white") + 
+  theme(axis.text.x=element_text(size=5), axis.text.y=element_text(size=5))
+```
+
+### Sub-Saharan Africa
+
+```{r}
+wdi %>% 
+  filter(Region == 'Sub-Saharan Africa') %>%
+  select(5:40) %>%
+  cor %>% 
+  ggcorrplot(hc.order = T, type = "lower", outline.col = "white") + 
+  theme(axis.text.x=element_text(size=5), axis.text.y=element_text(size=5))
+```
+
+### Latin America & Caribbean
+
+```{r}
+wdi %>% 
+  filter(Region == 'Latin America & Caribbean') %>%
+  select(5:40) %>%
+  cor %>% 
+  ggcorrplot(hc.order = T, type = "lower", outline.col = "white") + 
+  theme(axis.text.x=element_text(size=5), axis.text.y=element_text(size=5))
+```
+
+### North America
+
+```{r}
+wdi %>% 
+  filter(Region == 'North America') %>%
+  select(5:40) %>%
+  cor %>% 
+  ggcorrplot(hc.order = T, type = "lower", outline.col = "white") + 
+  theme(axis.text.x=element_text(size=5), axis.text.y=element_text(size=5))
+```
+
+We can observe that all graphs share the same, similar triangle for positive correlation and a similar area for negative correlation (although those are more vivid in North America - most likely thanks to the uniqueness of the USA). Because of that, we can conclude that the correlation is analogous for each region. Therefore, the following analysis will focus on the correlation matrix for the entire dataset.
+
+Most correlations that we can notice there are trivial, eg.:
+
+* population in total with the population in urban or rural areas,
+* male population with the female population,
+* land area with population,
+* methane emission with nitrous oxide emission
+* and more (of similar nature)
+
+What can be quite interesting at a first glance is that there is a strong negative correlation (close to -1.0) between males (% of the total population) and females (% of the total population). But after a closer inspection and a bit of thinking it is quite obvious. When the % of females is increasing, the % of males has to decrease at the same time and vice versa. Those two values cannot grow together. 
+
+On average, there used to be slightly more women than men between the years 1970 and 2009. After that year, it changed. 2009 was also a year when Bitcoin was first introduced. Coincidence?
+
+```{r}
+p <- wdi %>% 
+  select(Year, SP.POP.TOTL.MA.ZS, SP.POP.TOTL.FE.ZS) %>% 
+  arrange(Year) %>% 
+  group_by(Year) %>% 
+  summarise(Male = mean(SP.POP.TOTL.MA.ZS), Female = mean(SP.POP.TOTL.FE.ZS)) %>%
+  gather(key="gender", value="Percentage", 2:3) %>%
+  ggplot(aes(x=Year, y=Percentage, group=gender, color=gender)) + 
+    geom_line() + 
+    ggtitle('% of total population with regards to gender') + 
+    geom_vline(xintercept=2009) +
+    geom_text(aes(x=2009, y=50, label="Bitcoin initial release"), color="black") +
+    theme_bw()
+ggplotly(p)
+```
+
+Another curious finding might be that there is a positive correlation (but not that strong - around 0.75) between the number of under-five deaths (number of children dying before reaching age five) and the total population. It would be expected that those indicators grow together similarly (correlation closer to 1.0), but they are not. It might mean that as years go by, medicine is getting more and more advanced. Thanks to that, the number of under-five deaths does not grow as rapidly as the total population.
+
+[This source](https://data.unicef.org/topic/child-survival/under-five-mortality/) claims that the global under-five mortality rate declined by 59 per cent, from 93 deaths per 1,000 live births in 1990 to 38 in 2019.
+
+```{r}
+p <- wdi %>% 
+  select(Year, SH.DTH.MORT) %>% 
+  arrange(Year) %>% 
+  group_by(Year) %>% 
+  summarize(U5_deaths_avg = mean(SH.DTH.MORT)) %>%
+  ggplot(aes(x=Year, y=U5_deaths_avg)) + geom_line() + geom_point() + xlim(1990, 2020) + ggtitle("Average number of under-five deaths in a given year") + theme_bw()
+ggplotly(p)
+```
+
+Another discovery that is not very surprising (but quite alarming) is that there is a strong correlation (close to 1.0) between a total population and the amount of different gases that countries produce that influence climate change and global warming. This is to be expected - the more people there are, the more houses, factories, machines, etc. we produce.
+
+Given the fact that the world's population is constantly growing at a very rapid rate, greenhouse gases production is also going to increase as well.
+
+```{r}
+p <- wdi %>%
+ filter(Region != "") %>%
+ group_by(Region, Year) %>%
+ summarise(`Total emission` = mean(EN.ATM.NOXE.KT.CE)) %>%
+ ggplot(aes(x=Year, y=`Total emission`, group=Region, color=Region)) + geom_line() + ggtitle("Total nitrous oxide emissions by region") + theme_bw()
+ggplotly(p)
+```
+
+```{r}
+p <- wdi %>%
+ filter(Region != "") %>%
+ group_by(Region, Year) %>%
+ summarise(`Total emission` = mean(EN.ATM.METH.KT.CE)) %>%
+ ggplot(aes(x=Year, y=`Total emission`, group=Region, color=Region)) + geom_line() + ggtitle("Total methane emissions by region") + theme_bw()
+ggplotly(p)
+```
+
+```{r}
+p <- wdi %>%
+ filter(Region != "") %>%
+ group_by(Region, Year) %>%
+ summarise(`Total emission` = mean(EN.ATM.CO2E.KT)) %>%
+ ggplot(aes(x=Year, y=`Total emission`, group=Region, color=Region)) + geom_line() + ggtitle("Total CO2 emissions by region") + theme_bw()
+ggplotly(p)
+```
+
+We can notice on the charts above quite a sharp decline in all gases emission after the year 1990. [This article on Nature](https://www.nature.com/articles/d41586-019-02024-6) claims that it can be contributed to the Soviet Union’s collapse because it meant many people stopped eating meat. An estimated one-third of late-Soviet cropland has been abandoned after the post-communist economic crisis.
+
+## The effect of the COVID-19 pandemic
+
+This section presents a quick overview of the effect that the COVID-19 pandemic had on the world's economy. There is widespread agreement among economists that it will have severe negative impacts on the global economy.
+
+```{r}
+wdi %>% 
+  group_by(Year) %>% 
+  summarise(avg_GDP_growth = mean(NY.GDP.PCAP.KD.ZG)) %>% 
+  ggplot(aes(x = Year, y = avg_GDP_growth)) + 
+  geom_line(color="red") + 
+  ggtitle("Average GDP per capita growth (annual %)") + 
+  ylab("Growth") +
+  theme_bw()
+```
+
+The world, on average, lost around 5 percent of the gross domestic product in 2020 as we can see above.
+
+To put this number in perspective, global GDP was estimated at around 84.54 trillion U.S. dollars in 2020 – meaning that a 4.5 percent drop in economic growth results in almost 2.96 trillion U.S. dollars of lost economic output.
+
+# Predicting the price of a Bitcoin
+
+This section focuses on creating a model that can predict the price of a Bitcoin.
+
+### Creating a dataset
+
+The dataset used for training the model will consist of the following attributes:
+
+* Bitcoin market price (target variable)
+* 3 blockchain related attributes (difficulty, hash rate and trade volume - they were described in the [Bitcoin](#bitcoin) section)
+* Euro price
+* Gold price
+* S.P Composite
+* USA total population
+* USA CO2 emission
+* USA methane emission
+* USA nitrous oxide emission
+
+These last four attributes were chosen because they were described in more detail in the previous section about the correlation. The USA was selected in particular because it is the main producer of those greenhouse gases.
+
+```{r echo=T}
+usa_indicators <- wdi %>% 
+  filter(`Country Name` == 'United States') %>% 
+  select(Year, SP.POP.TOTL, EN.ATM.CO2E.KT, EN.ATM.METH.KT.CE, EN.ATM.NOXE.KT.CE) %>% 
+  rename(US_Population = 2, US_CO2_emission = 3, US_Methane_emission = 4, US_Nitrous_oxide_emission = 5)
+
+data <- bchain %>%
+  mutate(Year = as.numeric(format(Date, "%Y"))) %>%
+  left_join(ex_rates, by="Date") %>% 
+  left_join(gold_prices, by="Date") %>% 
+  left_join(sp_composite %>% select(Date, S.P.Composite), by="Date") %>%
+  left_join(usa_indicators, by="Year") %>%
+  select(-Year) %>%
+  arrange(Date) %>%
+  rename(Gold = USD..AM.)
+```
+
+### Filling missing values
+
+First, years 2009 and half of 2010 are going to be discarded, because Bitcoin's market price for those years is equal to 0. The first day when Bitcoin price rise above zero is 2010-08-18 and therefore this is going to be the starting point in the dataset.
+
+After that, there are still some missing values. For example, S.P Composite is collected only once per month. Those values are going to be filled using the nearby entry strategy.
+
+Moreover, for some reason, trade volume has zero values randomly placed in the dataset. For example, for 2012-11-27 the trade volume is 389726.0, for 2012-11-28 it is 0, then on 2012-11-29, it is back at 331048.97. Hence, those values too are going to be replaced with values from nearby entries.
+
+```{r echo = T}
+data <- data %>% 
+  filter(Date >= "2010-08-18") %>%
+  fill(everything(), .direction = "up") %>%
+  fill(everything(), .direction = "down") %>%
+  select(-Date)
+
+data[data$Trade_volume == 0, "Trade_volume"] = NA
+
+data <- data %>%
+  fill(Trade_volume, .direction = "up") %>%
+  fill(Trade_volume, .direction = "down")
+```
+
+The summary of the final dataset is presented in the table below:
+
+```{r}
+knitr::kable(summary(data)) %>% kable_styling() %>% kableExtra::scroll_box(width = "100%")
+```
+
+### Training and tuning the model
+
+To begin with, train and test sets have to be created. Because we deal with time series, regular stratified partitioning with the *createDataPartition* function would not be quite appropriate. Therefore, manual splitting is performed (on a dataset that is already sorted by date ascending). An 80/20% split is created. The train set will be further divided into train and validation sets.
+
+```{r echo = T}
+breaking_point_index <- nrow(data) * 0.8
+
+train <- data[1:breaking_point_index,]
+test <- data[(breaking_point_index + 1):nrow(data),]
+```
+
+There are 3253 rows in the training set and 813 in the test set.
+
+As mentioned earlier, we deal with time series, so any kind of cross-validation or similar methods would not be correct. We could have mixed values from different dates in training and validation sets. Luckily, the *trainControl* method allows us to choose a "timeslice" method that uses [rolling forecasting origin techniques](https://topepo.github.io/caret/data-splitting.html#data-splitting-for-time-series), that move the training and test sets in time.
+
+Parameters passed to that method are specified so that there will be 8 windows created in total, where each training set has 800 rows and validation set 200 rows.
+
+```{r echo = T}
+fitControl <- trainControl(method = "timeslice", fixedWindow = T, initialWindow = 800, horizon = 200, skip = 300)
+```
+
+#### Stochastic Gradient Boosting
+
+First, let's try training using Stochastic Gradient Boosting.
+
+```{r, echo = T}
+gbmFit <- train(Market_price ~ ., data = train, method = "gbm",  trControl = fitControl, verbose = F)
+gbmFit
+```
+
+#### Quantile Random Forest
+
+Another algorithm that will be tested is Quantile Random Forest.
+
+```{r, echo = T}
+qrfFit <- train(Market_price ~ ., data = train, method = "qrf",  trControl = fitControl)
+qrfFit
+```
+
+#### Comparing the results between models
+
+```{r}
+resamps <- resamples(list(GBM = gbmFit, QRF = qrfFit))
+bwplot(resamps, layout = c(3, 1))
+```
+
+R squared is not visible because of the scale of the axis, so let's plot it separately.
+
+```{r}
+dotplot(resamps, metric = "Rsquared")
+```
+
+As we can see, Stochastic Gradient Boosting performs slightly better in general, and it is chosen as the final model.
+
+### Variable importance
+
+```{r}
+gbmImp <- varImp(gbmFit)
+plot(gbmImp)
+```
+
+Not surprisingly, the most important attribute is one that is related directly to blockchain technology - difficulty. It is something that our intuition would say because the bigger the Bitcoin price, the more people are interested in it, there are more miners and the difficulty of finding a new block grows as well.
+
+What can be surprising is that the S.P Composite attribute is more important than the two remaining blockchain attributes (trade volume and hash rate).
+
+What is quite remarkable here is that the US emission of CO2 is a better predictor of Bitcoin's price than the Euro or gold price. According to the plot, they play no role in predicting the price (the same goes for the total US population, US methane, and nitrous oxide emissions).
+
+### Measuring performance
+
+For measuring the performance of the best model selected on the test set, some standard metrics for regression are used:
+
+* RMSE (root mean squared error)
+* R squared
+* MAE (mean absolute error)
+
+```{r}
+predicted <- predict(gbmFit, test)
+
+postResample(pred = predicted, obs = test$Market_price)
+```
+
+As one can see in the table above, the results are not extraordinary. Even though the R squared value on the test set is similar to the values observed on the training set, the RMSE is a bit higher. The reason for this is most likely the fact that there was a huge increase in Bitcoin's price in 2021 and this data was not available for the training set. A potential solution would be to include more data so that the model could "see" that rapid growth.
+
+Predicting the price of Bitcoin is hard because there are much more factors affecting it than were captured here in this report. For example, even trivial things like a positive tweet from Elon Musk with regards to cryptocurrency can have a tremendous effect on the market price.
+
+### ARIMA model
+
+We can also try some time series modeling with ARIMA.
+
+First, a dataset is going to be created and split into train and test sets. It is going to be devised using the same rules as in the previous section. We don't need additional features that were used when creating a regressor. Therefore, no additional tables are going to be joined. Only date and market price columns are left. We also start on the date 2010-08-18 because that is the first day when the Bitcoin price rises above 0.
+
+```{r, echo = T}
+data <- bchain %>%
+  select(Date, Market_price) %>%
+  filter(Date >= "2010-08-18") %>%
+  arrange(Date)
+
+arima_train <- data[1:breaking_point_index, ]
+arima_test <- data[(breaking_point_index + 1):nrow(data), ]
+```
+
+Now, since the Arima function only accepts univariate time series, we have to perform some transformations. The Zoo library has a built-in function for converting to a time series vector. We create a time series that changes daily in the specified date range.
+
+```{r, echo = T}
+arima_train_ts <-
+  zoo(arima_train$Market_price,
+      seq(
+        from = as.Date("2010-08-18"),
+        to = as.Date("2019-07-14"),
+        by = 1
+      ))
+arima_test_ts <-
+  zoo(arima_test$Market_price,
+      seq(
+        from = as.Date("2019-07-15"),
+        to = as.Date("2021-10-04"),
+        by = 1
+      ))
+```
+
+Additionally, as we saw in the [Bitcoin](#quick-peek-2) section when plotting the Bitcoin price, the data is not stationary and this is a requirement for the ARIMA model. To deal with this problem, we can compute differences of prices to stationarize the time series (by specifying the *d* parameter in the Arima() function - the difference order).
+
+Now, we can fit the ARIMA model by specifying the three parameters (p, q, and d).
+Luckily, we can test many combinations of those parameters using the *auto.arima* function.
+
+```{r, echo = T}
+auto.arima(arima_train_ts, trace = T, d = 1)
+```
+
+Finally, we can fit the model using the obtained parameters and evaluate the performance by predicting the next 20 values.
+
+```{r, echo = T}
+fitARIMA <- Arima(arima_train_ts, order = c(3, 1, 4))
+```
+
+#### Performance
+
+```{r}
+knitr::kable(accuracy(forecast(fitARIMA, h = 20), arima_test_ts[1:20, ])) %>% kable_styling()
+```
+
+Although the RMSE error is smaller than the one observed with the regressor created in the previous section, it is not accurate to compare that. The regressor was predicting values from the entire test set (that had 813 values) and the ARIA model predicted only the next 20 days. That also means it did not see that rapid growth of the price in 2021.
+
+This quick experiment showed that sometimes it might make sense to consider using a standard time series modeling algorithm that is faster to implement than a typical model for regression or at least use it as a baseline to compare it with other models.
+
+
+
+
